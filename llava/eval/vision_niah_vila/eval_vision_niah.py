@@ -34,14 +34,10 @@ from datasets import load_dataset
 from matplotlib.colors import LinearSegmentedColormap
 from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
+from llava.eval.vision_niah_vila.qwen2 import Qwen2ForCausalLM
 
-from llava.eval.vision_niah_vila.zigzag_ring_attn.modeling_qwen2 import Qwen2ForCausalLM_RingAttn
-from llava.eval.vision_niah_vila.zigzag_ring_attn.monkey_patch import apply_zigzag_ring_attn_monkey_patch_llama
-from llava.eval.vision_niah_vila.zigzag_ring_attn.prepare_inputs import prepare_zigzag_ring_attn_inputs
 from llava.mm_utils import get_model_name_from_path
 from llava.model.builder import load_pretrained_model
-
-apply_zigzag_ring_attn_monkey_patch_llama()
 
 SEED = 24242424
 torch.manual_seed(SEED)
@@ -85,56 +81,23 @@ def eval_forward(accelerator, model, input_embeds, answer_embeds, pad_id, answer
     prompt_length = input_embeds.shape[1]
     labels_length = answer_embeds.shape[1]
     input_embeds = torch.cat([input_embeds, answer_embeds], dim=1)
-    # second pad input_embeds to the multiple of accelerator.num_processes
-    pad_tensor = (
-        torch.tensor(
-            [pad_id] * ((accelerator.num_processes * 2) - input_embeds.shape[1] % (accelerator.num_processes * 2))
-        )
-        .unsqueeze(0)
-        .unsqueeze(-1)
-        .expand(-1, -1, input_embeds.shape[-1])
-    )  # .to(accelerator.device)
-    input_embeds = torch.cat([input_embeds, pad_tensor], dim=1)
-    position_ids = (
-        torch.arange(input_embeds.shape[1]).unsqueeze(0).expand(input_embeds.shape[0], -1)
-    )  # .to(accelerator.device)
-    accelerator.print(input_embeds.shape)
-    prepared = prepare_zigzag_ring_attn_inputs(
-        input_embeds,
-        position_ids,
-        None,
-        accelerator.process_index,
-        accelerator.num_processes,
-        accelerator.device,
-    )
-    local_input_embeds = prepared["local_input_ids"]
-    local_position_ids = prepared["local_position_ids"]
+
+    # Generate position IDs
+    position_ids = torch.arange(input_embeds.shape[1]).unsqueeze(0).expand(input_embeds.shape[0], -1).to(input_embeds.device)
+
+    # Forward pass
     with torch.inference_mode():
         logits = model(
-            inputs_embeds=local_input_embeds,
-            position_ids=local_position_ids,
+            inputs_embeds=input_embeds,
+            position_ids=position_ids,
             use_cache=False,
+            num_logits_to_keep=labels_length + 1,
         ).logits
         pred = logits.argmax(dim=-1)
 
-    # gather all logits using accelerator.gather
-    def undo_extract_local(gathered_value, world_size, dim=1):
-        value_chunks = gathered_value.chunk(2 * world_size, dim=dim)
-        reordered_chunks = [None] * (2 * world_size)
-        for i in range(world_size):
-            reordered_chunks[i] = value_chunks[i * 2]
-            reordered_chunks[2 * world_size - i - 1] = value_chunks[i * 2 + 1]
-        return torch.cat(reordered_chunks, dim=dim)
-
-    correct = False
-
-    gathered_logits = accelerator.gather(pred.squeeze(0)).unsqueeze(0)
-    # undo extract local on the gathered logits
-    pred = undo_extract_local(gathered_logits, accelerator.num_processes)
-
-    pred = pred[:, prompt_length - 1 : prompt_length + labels_length - 1]
-    # check if the logits are correct, extract argmax id
-    # compare the predicted_ids with the labels
+    # Extract relevant predictions
+    # pred = pred[:, prompt_length-1:prompt_length+labels_length-1]
+    pred = pred[:, :-1]
     pred_text = tokenizer.decode(pred.squeeze().tolist())
     answer_text = tokenizer.decode(answer_ids.squeeze().tolist())
     correct = pred_text.replace(" ", "").lower() == answer_text.replace(" ", "").lower()
@@ -145,7 +108,6 @@ def eval_forward(accelerator, model, input_embeds, answer_embeds, pad_id, answer
             "Answer: ",
             answer_text,
         )
-        # print id as well
         print(
             "Predicted: ",
             pred.squeeze().tolist(),
@@ -162,6 +124,7 @@ def load_haystack(args, accelerator):
 
 def load_text_embeddings(str, tokenizer, model, accelerator, replace_double_newline=False):
     token_ids = safe_tokenize(tokenizer, str)
+    token_ids = token_ids.to(accelerator.device)
 
     def replace_double_newline_func(token_ids):
         double_newline_loc = (token_ids == 271).nonzero()[:, 1]
@@ -219,10 +182,11 @@ def inference(args):
     )
     kwargs = {"rope_theta": args.rope_theta} if args.rope_theta is not None else {}
     if "qwen2" in args.model.lower() or "longva" in args.model.lower():
-        model = Qwen2ForCausalLM_RingAttn.from_pretrained(
+        model = Qwen2ForCausalLM.from_pretrained(
             os.path.join(args.model, "llm"),
             torch_dtype=torch.bfloat16,
             _attn_implementation="flash_attention_2",
+            device_map=accelerator.device,
             **kwargs,
         )
     else:
@@ -297,6 +261,7 @@ def inference(args):
                     )
                     .view(-1, haystack_embeddings.shape[-1])
                     .unsqueeze(0)
+                    .to(accelerator.device)
                 )
                 input_emebds = torch.cat(
                     [
